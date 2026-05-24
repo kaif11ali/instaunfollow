@@ -96,14 +96,18 @@ const saveCookies = async (page) => {
 };
 
 // ─── Check if the current page is a logged-in Instagram session ────────────────
+// NOTE: Do NOT use page.$() here – after SPA client-side routing the JS execution
+// context is invalidated and page.$() throws "Cannot find context with specified id".
+// URL inspection is sufficient: Instagram always redirects to /accounts/login/ when
+// the session is not authenticated.
 const checkLoggedIn = async (page) => {
-  const url = page.url();
-  // Redirected to login / signup = not logged in
-  if (/\/(accounts\/login|accounts\/emailsignup)/.test(url)) return false;
-  // Login form visible = not logged in
-  const loginInput = await page.$('input[name="username"]');
-  if (loginInput) return false;
-  return true;
+  try {
+    const url = page.url();
+    if (/\/accounts\/(login|emailsignup)/.test(url)) return false;
+    return true;
+  } catch (_) {
+    return false;
+  }
 };
 
 // ─── Try cookie-based login ────────────────────────────────────────────────────
@@ -114,9 +118,13 @@ const tryCookieLogin = async (page) => {
     log.info("No valid cookies found – will try credential login.");
     return false;
   }
-  // Navigate to home and check if session is alive
-  await page.goto(HOME_URL, { waitUntil: "networkidle2", timeout: 30000 });
-  await delay(2000);
+  // Navigate to home and check if session is alive.
+  // Use "load" (not "networkidle2") – Instagram makes constant XHR so networkidle2
+  // never fires. "load" waits for window.onload which is reliable enough.
+  await page.goto(HOME_URL, { waitUntil: "load", timeout: 60000 });
+  // Extra 4 s to let the SPA settle and any client-side redirects complete
+  // (e.g. expired session → /accounts/login/)
+  await delay(4000);
   const ok = await checkLoggedIn(page);
   if (ok) {
     log.info("✅ Cookies are valid – already logged in.");
@@ -129,7 +137,7 @@ const tryCookieLogin = async (page) => {
 // ─── Login with username + password ───────────────────────────────────────────
 const credentialLogin = async (page) => {
   log.info("🔐 Logging in with username and password...");
-  await page.goto(LOGIN_URL, { waitUntil: "networkidle2", timeout: 30000 });
+  await page.goto(LOGIN_URL, { waitUntil: "load", timeout: 60000 });
   await delay(2000);
 
   // Dismiss GDPR / cookie-consent banner (varies by region)
@@ -190,7 +198,17 @@ const credentialLogin = async (page) => {
   });
   if (!submitted) throw new Error("Login submit button not found.");
 
-  await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30000 });
+  // waitForNavigation must be set up BEFORE the click fires to avoid a race
+  // condition where the navigation completes before Node.js calls waitForNavigation.
+  // We set it up above (navPromise) – but since we clicked inside page.evaluate the
+  // AJAX response takes ~1-2 s, so we can still call it here safely. Use "load"
+  // so we wait for the full page render, not just the initial HTML frame.
+  try {
+    await page.waitForNavigation({ waitUntil: "load", timeout: 60000 });
+  } catch (_) {
+    // Some Instagram flows redirect via history.pushState without a full load event;
+    // if we timed out we still continue – the URL check below will catch failures.
+  }
   await delay(3000);
 
   // Handle 2FA / security challenge – wait for manual resolution
@@ -241,8 +259,8 @@ const credentialLogin = async (page) => {
 
 // ─── Open the following-list dialog (reused at the start of every batch) ───────
 const openFollowingDialog = async (page) => {
-  await page.goto(PROFILE_URL, { waitUntil: "networkidle2", timeout: 30000 });
-  await delay(2000);
+  await page.goto(PROFILE_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await delay(3000);
 
   const followingLinkSel = `a[href*="${INSTAGRAM_USERNAME}/following"]`;
 
@@ -282,7 +300,7 @@ const humanBreak = async (page) => {
   const destination = Math.random() > 0.5 ? HOME_URL : PROFILE_URL;
   const destName    = destination === HOME_URL ? "home feed" : "profile";
   log.info(`  🌐 Navigating to ${destName}…`);
-  await page.goto(destination, { waitUntil: "networkidle2", timeout: 30000 });
+  await page.goto(destination, { waitUntil: "domcontentloaded", timeout: 30000 });
   await delay(1500 + Math.random() * 1500);
 
   // Random scrolling (2-5 scroll steps)
@@ -337,7 +355,7 @@ let authSucceeded = false;
           await credentialLogin(page);
         }
         // Confirm we landed somewhere reasonable after auth
-        await page.goto(PROFILE_URL, { waitUntil: "networkidle2", timeout: 30000 });
+        await page.goto(PROFILE_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
         await delay(2000);
         authSucceeded = true;
         log.info("✅ Auth phase complete.");
@@ -352,6 +370,27 @@ let authSucceeded = false;
           return;
         }
 
+        // Crawlee may assign a fresh browser page for the UNFOLLOW request (e.g.
+        // after a retry). That page won't have the cookies we loaded in AUTH, so
+        // Instagram would show a login dialog instead of the following list.
+        // Guard: verify this page is authenticated; if not, load cookies now.
+        const alreadyIn = await checkLoggedIn(page);
+        if (!alreadyIn) {
+          log.info("🍪 UNFOLLOW page not authenticated – reloading cookies…");
+          const loaded = await loadCookies(page);
+          if (!loaded) {
+            log.error("❌ Could not reload cookies for UNFOLLOW page. Aborting.");
+            return;
+          }
+          await page.goto(HOME_URL, { waitUntil: "load", timeout: 60000 });
+          await delay(4000);
+          if (!(await checkLoggedIn(page))) {
+            log.error("❌ Cookie re-auth failed for UNFOLLOW page. Aborting.");
+            return;
+          }
+          log.info("✅ UNFOLLOW page re-authenticated via cookies.");
+        }
+
         log.info(`Starting unfollow (${MAX_UNFOLLOW_COUNT} total, ${UNFOLLOW_BATCH_SIZE} per batch)…`);
 
         // Open the very first batch
@@ -361,6 +400,32 @@ let authSucceeded = false;
         }
         log.info("✅ Following dialog is open.");
         await delay(2000);
+
+        // Wait for the dialog to actually populate its list (Instagram lazy-loads)
+        log.info("⏳ Waiting for following list to load…");
+        try {
+          await page.waitForFunction(() => {
+            const d = document.querySelector('div[role="dialog"]');
+            if (!d) return false;
+            // Need at least 2 buttons: a close button + at least one Following button
+            return d.querySelectorAll("button, [role='button']").length >= 2;
+          }, { timeout: 10000 });
+          log.info("✅ Following list loaded.");
+        } catch (_) {
+          log.warning("⚠️  Timed out waiting for list. Will try anyway.");
+        }
+
+        // Debug: log actual button texts so we know what Instagram currently shows
+        const dbg = await page.evaluate(() => {
+          const dialog = document.querySelector('div[role="dialog"]');
+          if (!dialog) return { found: false };
+          const items = Array.from(dialog.querySelectorAll("button, [role='button']")).map(b => ({
+            text: b.textContent.trim(),
+            label: b.getAttribute("aria-label") || ""
+          }));
+          return { found: true, count: items.length, items };
+        }).catch(() => ({ found: false }));
+        log.info("📋 Dialog buttons: " + JSON.stringify(dbg));
 
         let unfollowedCount = 0;
         let batchCount     = 0;
@@ -392,11 +457,18 @@ let authSucceeded = false;
             }
 
             // ── Find and click the first visible "Following" button ───────────
+            // Instagram renders "Following" buttons in the list; match flexibly
+            // (the text might be "Following", have trailing spaces/icons, or differ
+            // by locale; aria-label fallback handles icon-only buttons).
             const found = await page.evaluate(() => {
               const dialog = document.querySelector('div[role="dialog"]');
               if (!dialog) return null;
-              const btn = Array.from(dialog.querySelectorAll("button")).find(
-                (b) => b.textContent.trim() === "Following"
+              const btn = Array.from(dialog.querySelectorAll("button, [role='button']")).find(
+                (b) => {
+                  const txt = b.textContent.trim();
+                  const lbl = (b.getAttribute("aria-label") || "").toLowerCase();
+                  return /^following/i.test(txt) || lbl.startsWith("following");
+                }
               );
               if (!btn) return null;
               const row =
