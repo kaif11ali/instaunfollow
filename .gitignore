@@ -22,3 +22,9 @@ Thumbs.db
 
 #Environment variables
 .env
+
+# Session / auth data
+cookies.json
+
+# Screenshots
+*.png
