@@ -96,15 +96,16 @@ const saveCookies = async (page) => {
 };
 
 // ─── Check if the current page is a logged-in Instagram session ────────────────
-// NOTE: Do NOT use page.$() here – after SPA client-side routing the JS execution
-// context is invalidated and page.$() throws "Cannot find context with specified id".
-// URL inspection is sufficient: Instagram always redirects to /accounts/login/ when
-// the session is not authenticated.
+// NOTE: Instagram's profile pages are publicly accessible, so the URL alone is
+// not enough to determine auth state (URL stays on /buildwithkf/ even when logged
+// out). Check the sessionid cookie instead – it is present only when authenticated.
 const checkLoggedIn = async (page) => {
   try {
     const url = page.url();
     if (/\/accounts\/(login|emailsignup)/.test(url)) return false;
-    return true;
+    // sessionid is Instagram's primary session cookie; absence = not logged in
+    const cookies = await page.cookies();
+    return cookies.some((c) => c.name === "sessionid" && c.value);
   } catch (_) {
     return false;
   }
@@ -121,7 +122,7 @@ const tryCookieLogin = async (page) => {
   // Navigate to home and check if session is alive.
   // Use "load" (not "networkidle2") – Instagram makes constant XHR so networkidle2
   // never fires. "load" waits for window.onload which is reliable enough.
-  await page.goto(HOME_URL, { waitUntil: "load", timeout: 60000 });
+  await page.goto(HOME_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
   // Extra 4 s to let the SPA settle and any client-side redirects complete
   // (e.g. expired session → /accounts/login/)
   await delay(4000);
@@ -137,7 +138,7 @@ const tryCookieLogin = async (page) => {
 // ─── Login with username + password ───────────────────────────────────────────
 const credentialLogin = async (page) => {
   log.info("🔐 Logging in with username and password...");
-  await page.goto(LOGIN_URL, { waitUntil: "load", timeout: 60000 });
+  await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
   await delay(2000);
 
   // Dismiss GDPR / cookie-consent banner (varies by region)
@@ -204,7 +205,7 @@ const credentialLogin = async (page) => {
   // AJAX response takes ~1-2 s, so we can still call it here safely. Use "load"
   // so we wait for the full page render, not just the initial HTML frame.
   try {
-    await page.waitForNavigation({ waitUntil: "load", timeout: 60000 });
+    await page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 60000 });
   } catch (_) {
     // Some Instagram flows redirect via history.pushState without a full load event;
     // if we timed out we still continue – the URL check below will catch failures.
@@ -259,7 +260,7 @@ const credentialLogin = async (page) => {
 
 // ─── Open the following-list dialog (reused at the start of every batch) ───────
 const openFollowingDialog = async (page) => {
-  await page.goto(PROFILE_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.goto(PROFILE_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
   await delay(3000);
 
   const followingLinkSel = `a[href*="${INSTAGRAM_USERNAME}/following"]`;
@@ -269,6 +270,14 @@ const openFollowingDialog = async (page) => {
     await page.waitForSelector(followingLinkSel, { visible: true, timeout: 8000 });
     await page.click(followingLinkSel);
     await page.waitForSelector('div[role="dialog"]', { visible: true, timeout: 20000 });
+    // Reject login-gate dialogs (shown when the page is not authenticated)
+    const isLoginGate = await page.evaluate(() => {
+      const d = document.querySelector('div[role="dialog"]');
+      return d ? Array.from(d.querySelectorAll("button")).some(
+        (b) => /^(sign up|log in)$/i.test(b.textContent.trim())
+      ) : false;
+    });
+    if (isLoginGate) { await page.keyboard.press("Escape"); return false; }
     return true;
   } catch (_) { /* fall through */ }
 
@@ -284,6 +293,14 @@ const openFollowingDialog = async (page) => {
       if (clickable) clickable.click();
     });
     await page.waitForSelector('div[role="dialog"]', { visible: true, timeout: 20000 });
+    // Reject login-gate dialogs
+    const isLoginGate2 = await page.evaluate(() => {
+      const d = document.querySelector('div[role="dialog"]');
+      return d ? Array.from(d.querySelectorAll("button")).some(
+        (b) => /^(sign up|log in)$/i.test(b.textContent.trim())
+      ) : false;
+    });
+    if (isLoginGate2) { await page.keyboard.press("Escape"); return false; }
     return true;
   } catch (_) { /* fall through */ }
 
@@ -300,7 +317,7 @@ const humanBreak = async (page) => {
   const destination = Math.random() > 0.5 ? HOME_URL : PROFILE_URL;
   const destName    = destination === HOME_URL ? "home feed" : "profile";
   log.info(`  🌐 Navigating to ${destName}…`);
-  await page.goto(destination, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.goto(destination, { waitUntil: "domcontentloaded", timeout: 60000 });
   await delay(1500 + Math.random() * 1500);
 
   // Random scrolling (2-5 scroll steps)
@@ -339,6 +356,7 @@ let authSucceeded = false;
       launchOptions: {
         headless: false,
         defaultViewport: null,
+        executablePath: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
         args: ["--start-maximized", "--no-sandbox", "--disable-setuid-sandbox"],
       },
     },
@@ -355,7 +373,7 @@ let authSucceeded = false;
           await credentialLogin(page);
         }
         // Confirm we landed somewhere reasonable after auth
-        await page.goto(PROFILE_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
+        await page.goto(PROFILE_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
         await delay(2000);
         authSucceeded = true;
         log.info("✅ Auth phase complete.");
@@ -382,7 +400,7 @@ let authSucceeded = false;
             log.error("❌ Could not reload cookies for UNFOLLOW page. Aborting.");
             return;
           }
-          await page.goto(HOME_URL, { waitUntil: "load", timeout: 60000 });
+          await page.goto(HOME_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
           await delay(4000);
           if (!(await checkLoggedIn(page))) {
             log.error("❌ Cookie re-auth failed for UNFOLLOW page. Aborting.");
@@ -444,7 +462,12 @@ let authSucceeded = false;
                 break;
               }
               log.info("✅ Following dialog reopened. Continuing…");
-              await delay(1500);
+              // Wait for the list to populate before resuming unfollows
+              await page.waitForFunction(() => {
+                const d = document.querySelector('div[role="dialog"]');
+                return d && d.querySelectorAll("button, [role='button']").length >= 2;
+              }, { timeout: 8000 }).catch(() => {});
+              await delay(1000);
               batchCount    = 0;
               noProgressStreak = 0;
               continue;
@@ -471,13 +494,20 @@ let authSucceeded = false;
                 }
               );
               if (!btn) return null;
-              const row =
-                btn.closest("li") ||
-                btn.closest('[role="listitem"]') ||
-                btn.parentElement?.parentElement;
-              const link = row?.querySelector("a[href]");
-              const username = link
-                ? link.getAttribute("href").replace(/\//g, "").trim()
+              // Walk up the DOM to find the closest ancestor that also contains
+              // a profile link (Instagram uses nested divs, not necessarily <li>)
+              let container = btn.parentElement;
+              let profileLink = null;
+              while (container && container !== dialog) {
+                const a = container.querySelector('a[href]');
+                if (a) {
+                  const href = a.getAttribute('href');
+                  if (/^\/[^/]+\/?$/.test(href)) { profileLink = a; break; }
+                }
+                container = container.parentElement;
+              }
+              const username = profileLink
+                ? profileLink.getAttribute('href').replace(/\//g, '').trim()
                 : null;
               btn.click();
               return { username };
@@ -564,9 +594,12 @@ let authSucceeded = false;
     },
   });
 
+  // Use a per-run unique key so crawlee's request deduplication never skips
+  // requests from a previous completed run.
+  const runId = Date.now();
   await crawler.addRequests([
-    { url: HOME_URL,    userData: { label: "AUTH"     } },
-    { url: PROFILE_URL, userData: { label: "UNFOLLOW" } },
+    { url: HOME_URL,    uniqueKey: `AUTH-${runId}`,     userData: { label: "AUTH"     } },
+    { url: PROFILE_URL, uniqueKey: `UNFOLLOW-${runId}`, userData: { label: "UNFOLLOW" } },
   ]);
 
   await crawler.run();
