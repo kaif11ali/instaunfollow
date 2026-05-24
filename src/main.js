@@ -11,6 +11,7 @@ const INSTAGRAM_PASSWORD  = process.env.INSTAGRAM_PASSWORD;
 const MAX_UNFOLLOW_COUNT  = parseInt(process.env.MAX_UNFOLLOW_COUNT) || 100;
 const UNFOLLOW_DELAY      = parseInt(process.env.UNFOLLOW_DELAY)     || 5000;
 const SCROLL_DELAY        = parseInt(process.env.SCROLL_DELAY)       || 3000;
+const UNFOLLOW_BATCH_SIZE = parseInt(process.env.UNFOLLOW_BATCH_SIZE)  || 10;
 
 if (!INSTAGRAM_USERNAME || !INSTAGRAM_PASSWORD) {
   log.error("Missing INSTAGRAM_USERNAME or INSTAGRAM_PASSWORD in .env");
@@ -238,6 +239,74 @@ const credentialLogin = async (page) => {
   log.info("✅ Credential login successful. Cookies saved.");
 };
 
+// ─── Open the following-list dialog (reused at the start of every batch) ───────
+const openFollowingDialog = async (page) => {
+  await page.goto(PROFILE_URL, { waitUntil: "networkidle2", timeout: 30000 });
+  await delay(2000);
+
+  const followingLinkSel = `a[href*="${INSTAGRAM_USERNAME}/following"]`;
+
+  // Attempt 1 – native Puppeteer click (fires real pointer events React can hear)
+  try {
+    await page.waitForSelector(followingLinkSel, { visible: true, timeout: 8000 });
+    await page.click(followingLinkSel);
+    await page.waitForSelector('div[role="dialog"]', { visible: true, timeout: 20000 });
+    return true;
+  } catch (_) { /* fall through */ }
+
+  // Attempt 2 – match the element whose visible text is "<N> following"
+  try {
+    await page.evaluate(() => {
+      const el = Array.from(document.querySelectorAll("a, button, span"))
+        .find((n) => /\d+\s*following/i.test(n.textContent.trim()));
+      const clickable =
+        el?.tagName === "A" || el?.tagName === "BUTTON"
+          ? el
+          : el?.closest("a, button");
+      if (clickable) clickable.click();
+    });
+    await page.waitForSelector('div[role="dialog"]', { visible: true, timeout: 20000 });
+    return true;
+  } catch (_) { /* fall through */ }
+
+  return false;
+};
+
+// ─── Human-like break between batches ─────────────────────────────────────────
+const humanBreak = async (page) => {
+  // Close the following dialog
+  await page.keyboard.press("Escape");
+  await delay(800 + Math.random() * 700);
+
+  // Randomly visit home feed or own profile
+  const destination = Math.random() > 0.5 ? HOME_URL : PROFILE_URL;
+  const destName    = destination === HOME_URL ? "home feed" : "profile";
+  log.info(`  🌐 Navigating to ${destName}…`);
+  await page.goto(destination, { waitUntil: "networkidle2", timeout: 30000 });
+  await delay(1500 + Math.random() * 1500);
+
+  // Random scrolling (2-5 scroll steps)
+  const steps = 2 + Math.floor(Math.random() * 4);
+  log.info(`  🖱️  Doing ${steps} random scroll(s)…`);
+  for (let i = 0; i < steps; i++) {
+    const dist = 250 + Math.floor(Math.random() * 550); // 250–800 px
+    await page.evaluate((d) => window.scrollBy({ top: d, behavior: "smooth" }), dist);
+    await delay(700 + Math.random() * 1300); // 0.7–2 s between scrolls
+  }
+
+  // Occasionally scroll back to the top
+  if (Math.random() > 0.4) {
+    await page.evaluate(() => window.scrollTo({ top: 0, behavior: "smooth" }));
+    await delay(600 + Math.random() * 600);
+  }
+
+  // Main wait: random 30–90 seconds to mimic a human taking a breather
+  const waitSecs = 30 + Math.floor(Math.random() * 61);
+  log.info(`  ⏳ Waiting ${waitSecs}s before next batch…`);
+  await delay(waitSecs * 1000);
+  log.info("  ✅ Break over. Reopening following list…");
+};
+
 // ─── Shared auth state (prevents UNFOLLOW running when AUTH failed) ──────────
 let authSucceeded = false;
 
@@ -275,90 +344,61 @@ let authSucceeded = false;
       }
 
       // ══════════════════════════════════════════════════════════════════════════
-      // UNFOLLOW PHASE
+      // UNFOLLOW PHASE – batches of UNFOLLOW_BATCH_SIZE with human-like breaks
       // ══════════════════════════════════════════════════════════════════════════
       if (request.userData.label === "UNFOLLOW") {
         if (!authSucceeded) {
           log.error("❌ AUTH phase did not succeed – skipping unfollow.");
           return;
         }
-        log.info("Opening following list…");
 
-        // Always start from the profile page and use a native Puppeteer click.
-        // page.evaluate(() => el.click()) doesn't fire real pointer events and
-        // React ignores it – page.click() simulates a full mouse event sequence.
-        await page.goto(PROFILE_URL, { waitUntil: "networkidle2", timeout: 30000 });
-        await delay(2000);
+        log.info(`Starting unfollow (${MAX_UNFOLLOW_COUNT} total, ${UNFOLLOW_BATCH_SIZE} per batch)…`);
 
-        // The "following" count on Instagram's profile page is a clickable
-        // element whose visible text is "<number> following".
-        // Use page.click() (native mouse events) so React's event handlers fire.
-        const followingLinkSel = `a[href*="${INSTAGRAM_USERNAME}/following"]`;
-        let dialogOpened = false;
-
-        // Attempt 1 – native click on the following link
-        try {
-          await page.waitForSelector(followingLinkSel, { visible: true, timeout: 8000 });
-          await page.click(followingLinkSel);
-          log.info("Clicked 'following' link. Waiting for dialog…");
-          await page.waitForSelector('div[role="dialog"]', { visible: true, timeout: 20000 });
-          dialogOpened = true;
-        } catch (e1) {
-          log.info(`Direct link click failed (${e1.message}). Trying text-based fallback…`);
-        }
-
-        // Attempt 2 – find any link/button whose text contains a number followed by "following"
-        if (!dialogOpened) {
-          try {
-            await page.evaluate(() => {
-              const el = Array.from(document.querySelectorAll("a, button, span"))
-                .find((n) => /\d+\s*following/i.test(n.textContent.trim()));
-              const clickable =
-                el?.tagName === "A" || el?.tagName === "BUTTON"
-                  ? el
-                  : el?.closest("a, button");
-              if (clickable) clickable.click();
-            });
-            await page.waitForSelector('div[role="dialog"]', { visible: true, timeout: 20000 });
-            dialogOpened = true;
-          } catch (e2) {
-            log.info(`Text fallback failed (${e2.message}).`);
-          }
-        }
-
-        if (!dialogOpened) {
+        // Open the very first batch
+        if (!(await openFollowingDialog(page))) {
           await page.screenshot({ path: "dialog_fail.png" });
           throw new Error("Following dialog did not open. Screenshot saved to dialog_fail.png");
         }
-
-        log.info("✅ Following dialog is open. Starting unfollow loop…");
+        log.info("✅ Following dialog is open.");
         await delay(2000);
 
         let unfollowedCount = 0;
+        let batchCount     = 0;
         const unfollowedUsers = new Set();
-        let noProgressStreak = 0; // safety guard against infinite loops
+        let noProgressStreak  = 0;
 
         while (unfollowedCount < MAX_UNFOLLOW_COUNT) {
           try {
-            // Make sure the dialog is still present
-            const dialogExists = await page.$('div[role="dialog"]');
-            if (!dialogExists) {
+            // ── Batch boundary: human-like break then reopen dialog ───────────
+            if (batchCount >= UNFOLLOW_BATCH_SIZE) {
+              log.info(`\n📦 Batch complete – ${unfollowedCount}/${MAX_UNFOLLOW_COUNT} unfollowed.`);
+              await humanBreak(page);
+
+              if (!(await openFollowingDialog(page))) {
+                log.error("❌ Could not reopen following dialog after break. Stopping.");
+                break;
+              }
+              log.info("✅ Following dialog reopened. Continuing…");
+              await delay(1500);
+              batchCount    = 0;
+              noProgressStreak = 0;
+              continue;
+            }
+
+            // ── Guard: dialog must still be open ─────────────────────────────
+            if (!(await page.$('div[role="dialog"]'))) {
               log.warning("Dialog closed unexpectedly.");
               break;
             }
 
-            // Find and click the first "Following" button in the dialog
+            // ── Find and click the first visible "Following" button ───────────
             const found = await page.evaluate(() => {
               const dialog = document.querySelector('div[role="dialog"]');
               if (!dialog) return null;
-
-              // Match button whose full text is exactly "Following"
               const btn = Array.from(dialog.querySelectorAll("button")).find(
                 (b) => b.textContent.trim() === "Following"
               );
               if (!btn) return null;
-
-              // Best-effort username extraction from the same list row
               const row =
                 btn.closest("li") ||
                 btn.closest('[role="listitem"]') ||
@@ -367,18 +407,16 @@ let authSucceeded = false;
               const username = link
                 ? link.getAttribute("href").replace(/\//g, "").trim()
                 : null;
-
               btn.click();
               return { username };
             });
 
             if (!found) {
-              // No "Following" button visible – scroll down to load more
+              // Scroll inside the dialog to reveal more accounts
               log.info('No "Following" buttons visible – scrolling…');
               const scrolled = await page.evaluate(() => {
                 const dialog = document.querySelector('div[role="dialog"]');
                 if (!dialog) return false;
-                // Find the first scrollable descendant
                 const inner = [...dialog.querySelectorAll("*")].find(
                   (el) =>
                     el.scrollHeight > el.clientHeight + 100 &&
@@ -404,7 +442,7 @@ let authSucceeded = false;
               continue;
             }
 
-            // Wait for the "Unfollow" confirmation button and click it
+            // ── Confirm unfollow in the pop-up dialog ─────────────────────────
             try {
               await page.waitForFunction(
                 () =>
@@ -421,12 +459,13 @@ let authSucceeded = false;
               });
 
               unfollowedCount++;
-              unfollowedUsers.add(found.username || `user_${unfollowedCount}`);
+              batchCount++;
               noProgressStreak = 0;
+              unfollowedUsers.add(found.username || `user_${unfollowedCount}`);
               log.info(
                 `✅ Unfollowed #${unfollowedCount}${
                   found.username ? ": @" + found.username : ""
-                }`
+                } — batch ${batchCount}/${UNFOLLOW_BATCH_SIZE}`
               );
               await delay(UNFOLLOW_DELAY);
             } catch (confirmErr) {
@@ -441,7 +480,7 @@ let authSucceeded = false;
           }
         }
 
-        log.info(`\n🏁 Done. Unfollowed ${unfollowedCount} users.`);
+        log.info(`\n🏁 Done. Unfollowed ${unfollowedCount}/${MAX_UNFOLLOW_COUNT} users.`);
         if (unfollowedUsers.size) {
           log.info("Users: " + [...unfollowedUsers].join(", "));
         }
