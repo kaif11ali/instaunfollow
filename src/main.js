@@ -69,7 +69,23 @@ const saveCookies = async (page) => {
           log.info("🔐 Logging in manually...");
           await page.goto(LOGIN_URL, { waitUntil: "networkidle2" });
 
-          await page.waitForSelector('input[name="username"]', { visible: true });
+          // Dismiss cookie/consent dialog that Instagram shows in some regions
+          try {
+            await page.waitForFunction(
+              () => Array.from(document.querySelectorAll('button'))
+                         .some(b => /accept|allow|cookie/i.test(b.textContent)),
+              { timeout: 5000 }
+            );
+            await page.evaluate(() => {
+              const btn = Array.from(document.querySelectorAll('button'))
+                .find(b => /accept|allow/i.test(b.textContent));
+              if (btn) btn.click();
+            });
+            log.info("Dismissed cookie consent dialog.");
+            await new Promise(res => setTimeout(res, 1500));
+          } catch (_) { /* no consent dialog, continue */ }
+
+          await page.waitForSelector('input[name="username"]', { visible: true, timeout: 60000 });
           await page.type('input[name="username"]', INSTAGRAM_USERNAME, { delay: 100 });
 
           await page.waitForSelector('input[name="password"]', { visible: true });
@@ -79,6 +95,31 @@ const saveCookies = async (page) => {
           await page.click('button[type="submit"]');
 
           await page.waitForNavigation({ waitUntil: "networkidle2" });
+
+          // Dismiss "Save your login info?" prompt if it appears
+          try {
+            await page.waitForSelector('button', { visible: true, timeout: 5000 });
+            const dismissed = await page.evaluate(() => {
+              const btn = Array.from(document.querySelectorAll('button'))
+                .find(b => b.textContent.trim() === 'Not Now' || b.textContent.trim() === 'Not now');
+              if (btn) { btn.click(); return true; }
+              return false;
+            });
+            if (dismissed) log.info("Dismissed 'Save login info' prompt.");
+          } catch (_) { /* prompt not shown, continue */ }
+
+          // Dismiss "Turn on notifications?" prompt if it appears
+          try {
+            await page.waitForSelector('button', { visible: true, timeout: 5000 });
+            const dismissed = await page.evaluate(() => {
+              const btn = Array.from(document.querySelectorAll('button'))
+                .find(b => b.textContent.trim() === 'Not Now' || b.textContent.trim() === 'Not now');
+              if (btn) { btn.click(); return true; }
+              return false;
+            });
+            if (dismissed) log.info("Dismissed 'Notifications' prompt.");
+          } catch (_) { /* prompt not shown, continue */ }
+
           await saveCookies(page);
         } else {
           log.info("✅ Cookies found. Navigating to Following page...");
@@ -126,26 +167,40 @@ const saveCookies = async (page) => {
 
               if (buttonText !== "Following") continue;
 
-              log.info(`Unfollowing user #${unfollowedCount + 1}`);
+              // Try to grab the username from a sibling link for accurate tracking
+              const username = await page.evaluate(el => {
+                const row = el.closest('li') || el.parentElement;
+                const link = row && row.querySelector('a[href]');
+                return link ? link.getAttribute('href').replace(/\//g, '') : null;
+              }, button);
+
+              log.info(`Unfollowing user #${unfollowedCount + 1}${username ? ': @' + username : ''}`);
 
               try {
-                await button.click(); // Click the “Following” button
-                log.info("Clicked unfollow button...");
+                await button.click(); // Click the "Following" button
+                log.info("Clicked 'Following' button, waiting for confirm dialog...");
 
-                // Wait for confirm dialog
-                await page.waitForSelector('button._a9--', { visible: true, timeout: 5000 });
-                const confirmButtons = await page.$$('button._a9--');
-                if (confirmButtons.length > 0) {
-                  await confirmButtons[0].click();
-                  log.info("✅ Confirmed unfollow.");
-                }
+                // Wait for the "Unfollow" confirmation button to appear (class-agnostic)
+                await page.waitForFunction(
+                  () => Array.from(document.querySelectorAll('button'))
+                             .some(b => b.textContent.trim() === 'Unfollow'),
+                  { timeout: 5000 }
+                );
+                await page.evaluate(() => {
+                  const btn = Array.from(document.querySelectorAll('button'))
+                                   .find(b => b.textContent.trim() === 'Unfollow');
+                  if (btn) btn.click();
+                });
+                log.info("✅ Confirmed unfollow.");
               } catch (err) {
                 log.error("Error during unfollow action: " + err.message);
+                await page.screenshot({ path: 'error_screenshot.png' });
+                log.info("📸 Screenshot saved to error_screenshot.png");
                 continue;
               }
 
               unfollowedCount++;
-              unfollowedUsers.add(buttonText);
+              unfollowedUsers.add(username || `user_${unfollowedCount}`);
               log.info(`Unfollowed ${unfollowedCount} users.`);
 
               // Delay before next
@@ -154,8 +209,12 @@ const saveCookies = async (page) => {
 
             log.info("📜 Scrolling to load more users...");
             await page.evaluate(() => {
-              const dialog = document.querySelector('div[role="dialog"] ._aano, div[role="dialog"] .isgrP');
-              if (dialog) dialog.scrollBy(0, 400);
+              const dialog = document.querySelector('div[role="dialog"]');
+              if (!dialog) return;
+              // Dynamically find the scrollable container inside the dialog
+              const scrollable = Array.from(dialog.querySelectorAll('div'))
+                .find(el => el.scrollHeight > el.clientHeight + 50);
+              (scrollable || dialog).scrollBy(0, 400);
             });
 
             await new Promise(res => setTimeout(res, SCROLL_DELAY));
