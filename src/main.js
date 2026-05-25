@@ -167,27 +167,27 @@ const credentialLogin = async (page) => {
   }
 
   // Fill username
-  await page.waitForSelector('input[name="username"]', {
+  await page.waitForSelector('[id="login_form"] [name="email"]', {
     visible: true,
     timeout: 30000,
   });
-  await page.click('input[name="username"]');
-  await page.type('input[name="username"]', INSTAGRAM_USERNAME, { delay: 80 });
+  await page.click('[id="login_form"] [name="email"]');
+  await page.type('[id="login_form"] [name="email"]', INSTAGRAM_USERNAME, { delay: 80 });
   await delay(400);
 
   // Fill password
-  await page.waitForSelector('input[name="password"]', {
+  await page.waitForSelector('[id="login_form"] [type="password"]', {
     visible: true,
     timeout: 10000,
   });
-  await page.click('input[name="password"]');
-  await page.type('input[name="password"]', INSTAGRAM_PASSWORD, { delay: 80 });
+  await page.click('[id="login_form"] [type="password"]');
+  await page.type('[id="login_form"] [type="password"]', INSTAGRAM_PASSWORD, { delay: 80 });
   await delay(400);
 
   // Click submit (try button[type="submit"] first, then text-match fallback)
   const submitted = await page.evaluate(() => {
     const btn =
-      document.querySelector('button[type="submit"]') ||
+      document.querySelector('[id="login_form"] [aria-label="Log In"]') ||
       Array.from(document.querySelectorAll("button")).find((b) =>
         /log\s*in/i.test(b.textContent.trim())
       );
