@@ -304,7 +304,7 @@ const openFollowingDialog = async (page) => {
     return true;
   } catch (_) { /* fall through */ }
 
-  
+  return false;
 };
 
 // ─── Human-like break between batches ─────────────────────────────────────────
